@@ -36,3 +36,8 @@ Verification for this migration: `swift test` passed (215 tests, one opt-in
 skip), and the three Linux Python runtime tests passed. Go is not installed in
 the migration environment, so neither Go suite was rerun. Native desktop
 acceptance is not established by these tests.
+
+The repository-hygiene check fails on template files absent from the original
+v0.3.5 commit, including `.editorconfig`, `.markdownlint.json`, and the template
+CI/issue workflows. The docs skeleton check passes. This migration preserves
+that baseline rather than adding unrelated repository scaffolding.

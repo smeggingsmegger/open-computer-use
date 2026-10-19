@@ -13,3 +13,8 @@ Validation: Swift tests passed (215 tests, one opt-in skip), and Linux Python
 runtime tests passed (3 tests). Go suites could not run because Go is unavailable.
 The preserved plans retain their existing unfinished native acceptance and
 semantic authorization work.
+
+The repository-hygiene check fails on template files absent from the original
+v0.3.5 commit, including `.editorconfig`, `.markdownlint.json`, and the template
+CI/issue workflows. The docs skeleton check passes. This migration preserves
+that baseline rather than adding unrelated repository scaffolding.
