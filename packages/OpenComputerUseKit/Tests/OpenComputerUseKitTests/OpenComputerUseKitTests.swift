@@ -30,6 +30,7 @@ final class OpenComputerUseKitTests: XCTestCase {
     func testCLIRecognizesCommandSpecificHelp() throws {
         XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["help", "snapshot"]), .help(command: "snapshot"))
         XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["snapshot", "--help"]), .help(command: "snapshot"))
+        XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["permissions"]), .permissions)
         XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["doctor", "-h"]), .help(command: "doctor"))
         XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["call", "--help"]), .help(command: "call"))
     }
@@ -2326,6 +2327,9 @@ final class OpenComputerUseKitTests: XCTestCase {
             treeLines: treeLines,
             focusedSummary: focusedSummary,
             focusedElement: nil,
+            focusedIdentity: nil,
+            inputWindow: nil,
+            inputWindowIdentity: nil,
             selectedText: selectedText,
             elements: [:]
         )

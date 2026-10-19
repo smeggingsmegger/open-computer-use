@@ -183,7 +183,7 @@ enum SkyClickDispatcher {
                 // path preserves AppKit compatibility. This is one dispatch policy,
                 // not a retry after an observed failure.
                 try spi.postToPid(event, pid: target.pid)
-                event.postToPid(target.pid)
+                try NativeInputGuard.post(event, pid: target.pid)
 
                 if step.delayAfter > 0 {
                     Thread.sleep(forTimeInterval: step.delayAfter)

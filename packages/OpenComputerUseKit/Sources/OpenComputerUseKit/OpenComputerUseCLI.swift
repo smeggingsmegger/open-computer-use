@@ -4,6 +4,7 @@ public enum OpenComputerUseCLICommand: Equatable {
     case launchOnboarding
     case mcp
     case doctor
+    case permissions
     case listApps
     case snapshot(app: String, textLimit: SnapshotTextLimit = .defaults, treeLimits: AccessibilityTreeLimits = .defaults)
     case call(OpenComputerUseCallInvocation)
@@ -32,7 +33,7 @@ public func shouldUseMacOSAppAgentProxy(
     switch command {
     case .launchOnboarding:
         return !runningFromLaunchServicesAppInstance
-    case .mcp, .doctor, .listApps, .snapshot, .call:
+    case .mcp, .doctor, .permissions, .listApps, .snapshot, .call:
         return true
     case .turnEnded, .help, .version:
         return false
@@ -76,6 +77,8 @@ public func parseOpenComputerUseCLI(arguments: [String]) throws -> OpenComputerU
         return .version
     case "mcp":
         return try parseSimpleCommand(name: "mcp", arguments: Array(arguments.dropFirst()), result: .mcp)
+    case "permissions":
+        return try parseSimpleCommand(name: "permissions", arguments: Array(arguments.dropFirst()), result: .permissions)
     case "doctor":
         return try parseSimpleCommand(name: "doctor", arguments: Array(arguments.dropFirst()), result: .doctor)
     case "list-apps":
@@ -108,6 +111,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         Commands:
           mcp                  Start the stdio MCP server.
           doctor               Print permission status and launch onboarding if needed.
+          permissions          Print permission status without showing onboarding.
           list-apps            Print running or recently used apps.
           snapshot <app>       Print the current accessibility snapshot for an app.
           call <tool>           Call one tool, or run a JSON array of tool calls.

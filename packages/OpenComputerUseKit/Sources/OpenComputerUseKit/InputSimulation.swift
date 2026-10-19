@@ -45,12 +45,13 @@ enum MouseButtonKind: String {
 enum InputSimulation {
     static let maxKeyboardUnicodeChunkLength = 64
 
-    static func prepareAppForGlobalPointerInput(_ app: RunningAppDescriptor) {
-        if raiseAppWindowViaAccessibility(pid: app.pid) {
+    static func prepareAppForGlobalPointerInput(_ app: RunningAppDescriptor) throws {
+        if try raiseAppWindowViaAccessibility(pid: app.pid) {
             Thread.sleep(forTimeInterval: 0.12)
             return
         }
 
+        try NativeInputGuard.validate(pid: app.pid)
         _ = app.runningApplication.activate(options: [.activateAllWindows])
         Thread.sleep(forTimeInterval: 0.25)
     }
@@ -105,7 +106,7 @@ enum InputSimulation {
         }
 
         event.location = point
-        event.postToPid(pid)
+        try NativeInputGuard.post(event, pid: pid)
         Thread.sleep(forTimeInterval: 0.1)
     }
 
@@ -115,7 +116,7 @@ enum InputSimulation {
         }
 
         event.location = point
-        event.post(tap: .cghidEventTap)
+        try NativeInputGuard.postGlobal(event)
         Thread.sleep(forTimeInterval: 0.1)
     }
 
@@ -181,8 +182,8 @@ enum InputSimulation {
                 down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
                 up.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
             }
-            down.postToPid(pid)
-            up.postToPid(pid)
+            try NativeInputGuard.post(down, pid: pid)
+            try NativeInputGuard.post(up, pid: pid)
             Thread.sleep(forTimeInterval: 0.02)
         }
     }
@@ -221,7 +222,7 @@ enum InputSimulation {
 
             activeFlags.insert(modifier.flag)
             event.flags = activeFlags
-            event.postToPid(pid)
+            try NativeInputGuard.post(event, pid: pid)
         }
 
         guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: true),
@@ -231,17 +232,18 @@ enum InputSimulation {
 
         keyDown.flags = activeFlags
         keyUp.flags = activeFlags
-        keyDown.postToPid(pid)
-        keyUp.postToPid(pid)
+        try NativeInputGuard.post(keyDown, pid: pid)
+        try NativeInputGuard.post(keyUp, pid: pid)
 
         for modifier in parsed.modifiers.reversed() {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: false) else {
                 throw ComputerUseError.message("Failed to create modifier key up event.")
             }
 
-            event.flags = activeFlags
-            event.postToPid(pid)
+            // The release carries the state after this modifier is lifted.
             activeFlags.remove(modifier.flag)
+            event.flags = activeFlags
+            try NativeInputGuard.post(event, pid: pid)
         }
 
         Thread.sleep(forTimeInterval: 0.1)
@@ -254,7 +256,7 @@ enum InputSimulation {
 
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         applyDragMotionFields(to: event, delta: delta, eventNumber: eventNumber)
-        event.post(tap: .cghidEventTap)
+        try NativeInputGuard.postGlobal(event)
         Thread.sleep(forTimeInterval: 0.03)
     }
 
@@ -306,25 +308,25 @@ enum InputSimulation {
         }
 
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
-        event.postToPid(pid)
+        try NativeInputGuard.post(event, pid: pid)
         Thread.sleep(forTimeInterval: 0.03)
     }
 
-    private static func raiseAppWindowViaAccessibility(pid: pid_t) -> Bool {
+    private static func raiseAppWindowViaAccessibility(pid: pid_t) throws -> Bool {
         let appElement = AXUIElementCreateApplication(pid)
         guard let window = preferredWindow(for: appElement) else {
             return false
         }
 
-        if performAction(named: kAXRaiseAction as String, on: window) {
+        if try performAction(named: kAXRaiseAction as String, on: window) {
             return true
         }
 
-        if setBoolAttribute(named: kAXMainAttribute as String, on: window) {
+        if try setBoolAttribute(named: kAXMainAttribute as String, on: window) {
             return true
         }
 
-        if setBoolAttribute(named: kAXFocusedAttribute as String, on: window) {
+        if try setBoolAttribute(named: kAXFocusedAttribute as String, on: window) {
             return true
         }
 
@@ -336,20 +338,20 @@ enum InputSimulation {
             ?? copyArray(appElement, attribute: kAXWindowsAttribute)?.first
     }
 
-    private static func performAction(named action: String, on element: AXUIElement) -> Bool {
+    private static func performAction(named action: String, on element: AXUIElement) throws -> Bool {
         guard availableActions(for: element).contains(where: { $0.caseInsensitiveCompare(action) == .orderedSame }) else {
             return false
         }
 
-        return AXUIElementPerformAction(element, action as CFString) == .success
+        return try NativeInputGuard.performAction(element, action as CFString) == .success
     }
 
-    private static func setBoolAttribute(named attribute: String, on element: AXUIElement) -> Bool {
+    private static func setBoolAttribute(named attribute: String, on element: AXUIElement) throws -> Bool {
         guard isSettable(element: element, attribute: attribute) else {
             return false
         }
 
-        return AXUIElementSetAttributeValue(element, attribute as CFString, kCFBooleanTrue) == .success
+        return try NativeInputGuard.setAttribute(element, attribute as CFString, kCFBooleanTrue) == .success
     }
 
     private static func isSettable(element: AXUIElement, attribute: String) -> Bool {

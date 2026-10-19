@@ -468,11 +468,15 @@ function Get-ElementValue($element, $TextLimit = $script:DefaultTextLimit) {
 
 function Get-ElementRecord($element, [int]$index, $windowBounds, $TextLimit = $script:DefaultTextLimit) {
     $frame = Get-ElementFrame $element $windowBounds
+    $decisionProtected = $true
+    try { $decisionProtected = [bool]$element.Current.IsPassword } catch {}
     $runtimeId = @()
     try { $runtimeId = @($element.GetRuntimeId()) } catch {}
     [pscustomobject]@{
         index = $index
         runtimeId = $runtimeId
+        decisionProtected = $decisionProtected
+        decisionEditable = (@(Get-PatternNames $element) -contains "SetValue")
         automationId = Get-ElementString $element "AutomationId"
         name = Limit-Text (Get-ElementString $element "Name") $TextLimit
         controlType = Get-ElementControlTypeName $element

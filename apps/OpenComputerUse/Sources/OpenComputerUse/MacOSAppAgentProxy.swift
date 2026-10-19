@@ -380,6 +380,9 @@ private final class AppAgentConnection: @unchecked Sendable {
                 }
                 return CLIProxyResponse(stdout: "", stderr: "", exitCode: EXIT_SUCCESS)
 
+            case .permissions:
+                return CLIProxyResponse(stdout: PermissionDiagnostics.current().summary + "\n", stderr: "", exitCode: EXIT_SUCCESS)
+
             case .doctor:
                 let permissions = PermissionDiagnostics.current()
                 if !permissions.missingPermissions.isEmpty {

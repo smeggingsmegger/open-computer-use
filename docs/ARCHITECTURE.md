@@ -5,7 +5,7 @@
 ## 当前目录结构
 
 - `apps/OpenComputerUse`
-  主入口，负责 `mcp`、`doctor`、`list-apps`、`snapshot`、`call`、`turn-ended` 等 CLI 命令，以及 `-h` / `--help` / `-v` / `--version` 这类全局参数；不带参数启动时会先检查权限，只有缺失时才进入无 Dock 图标的 app 模式权限引导窗口，`doctor` 也只会在检测到缺失权限时拉起这套 onboarding UI。
+  主入口，负责 `mcp`、`doctor`、`permissions`、`list-apps`、`snapshot`、`call`、`turn-ended` 等 CLI 命令，以及 `-h` / `--help` / `-v` / `--version` 这类全局参数；不带参数启动时会先检查权限，只有缺失时才进入无 Dock 图标的 app 模式权限引导窗口，`doctor` 也只会在检测到缺失权限时拉起这套 onboarding UI。
 - `apps/OpenComputerUseFixture`
   本地 GUI fixture app，用来承载低风险、可预测的点击/输入/滚动/拖拽验证路径。
 - `apps/OpenComputerUseSmokeSuite`
@@ -157,3 +157,170 @@
   - `open-computer-use snapshot <app>`
   - `open-computer-use call list_apps`
   - `open-computer-use call --calls '[{"tool":"get_app_state","args":{"app":"TextEdit"}}]'`
+
+`permissions` prints readiness without presenting onboarding, including through the app-agent proxy. Embedded hosts should use it for passive checks and reserve `doctor` or default launch for user-triggered onboarding.
+
+The macOS service requires an explicit `get_app_state` before input. Cached
+snapshots carry kernel process-start and executable-path evidence; stale process
+state invalidates every cached alias rather than silently inspecting a new app
+from an input call. This operation-entry lifetime guard does not replace signed
+app authorization or final per-event target validation.
+
+A private `taffy/app-identity` metadata RPC accepts `{ "query": "..." }` and
+returns versioned installed-app candidates with canonical paths and offline
+signature metadata. `taffy/appIdentityMetadata` is negotiated independently;
+this capability does not authorize or bind input. Ambiguous copies are returned
+as ambiguous, never selected by foreground order. Provider tools are unchanged.
+
+The private `taffy/app-call` v1 contract validates an expected installed identity
+and the running code at operation entry and snapshot capture. It is negotiated
+as `taffy/appBoundOperations`; it is not a provider tool or user authorization.
+Hosts may set `TAFFY_REQUIRE_APP_IDENTITY=1` to refuse ordinary unbound MCP input.
+The host must negotiate support and provide approved identities; standalone
+callers retain the existing behavior. The embedding host now supplies scoped
+grants. A thread-scoped guard checks process lifetime and code identity before
+each targeted CGEvent/SkyLight dispatch and Accessibility mutation, including
+snapshot recovery attributes. Identity failures throw before fallback input.
+Bound recovery does not reopen by bundle identifier. Required-binding mode also
+refuses low-level dispatch when the thread scope is missing. Global pointer
+events hit-test the Accessibility element at each location and validate its app
+before dispatch. Synthetic SkyLight focus validates the retained process
+lifetime and window owner before activation and deactivation. Modifier releases
+carry the remaining modifier flags, ending a completed shortcut with no flags.
+Interrupted operations now submit cleanup-only releases for recorded downs,
+revalidating original identity and retaining separate public, private, and global
+delivery paths. Global cleanup also checks the last submitted drag position.
+These checks do not prove that WindowServer has delivered or cleared input.
+
+The input guard can additionally accept a per-operation cancellation token.
+It checks that token before and after identity validation, and before global
+hit testing. Tokens are irreversible and thread-safe. In required-binding stdio
+mode, the reader runs one bound action on a serial queue and accepts private
+`taffy/cancel-operation` requests with the original `request_id` during execution.
+Additional actions are rejected, and matching cancellation permanently fences
+the helper. The reply reports `cancellation_requested` and explicitly sets
+`cleanup_confirmed` to false; it is not an operation-completion acknowledgment.
+EOF cancels active work and waits at most five seconds. Direct
+`handle`/app-agent proxy calls retain synchronous behavior. Held-input tracking runs on normal return and failure, with a 64-input limit
+and a half-second cleanup budget between validation calls. Blocking OS validation
+still needs host termination as fallback. Refused cleanup produces an uncertain
+input-state error. Only the required-binding stdio reader advertises
+`taffy/operationCancellation: 1`; synchronous direct/app-agent calls do not.
+The embedding host negotiates this capability and fences its session before
+sending a cancellation notification for the fully written active request. It
+bounds that write to 250 ms, then allows 500 ms for cooperative release before
+terminating the helper and confirming process exit under the existing lease.
+No cancellation reply or successful write proves OS cleanup. Aborted callers,
+partial writes, old helpers, and operation deadlines retain termination fallback.
+Native acceptance and updated bundle staging remain outstanding.
+
+App-bound indexed operations now reject cached Accessibility controls whose
+role, subrole, identifier, title, or description changed since snapshot capture,
+or whose current identity cannot be inspected. Evidence stays in memory with
+bounded strings and excludes field values. Direct indexed value writes, secondary actions, preferred AX clicks, and each
+direct Accessibility scroll action also recheck this evidence after app validation immediately before
+dispatch. Cancellation is checked again after that review. The review is local
+to the mutation; post-action snapshots and release-only cleanup do not inherit
+it. List selection also checks list/item evidence and their relationship; containing
+web-row clicks check the original control and the candidate row. Mouse and
+activation fallback paths, focused-key and coordinate review, full consequential
+semantic revalidation, and scoped action authorization remain unfinished. It does not establish native target fidelity.
+
+Bound Accessibility mutations also stop on generic failure, cannot-complete, or
+invalidated-target results. These outcomes cannot establish non-execution and
+must not trigger an alternate click path or keyboard append. Explicit unsupported
+operation responses retain fallback behavior. The error requires fresh inspection
+and verification; it does not establish whether the app completed the mutation.
+
+Focused text entry now captures bounded control identity with the snapshot and
+checks both the same Accessibility object and unchanged metadata before typing.
+Direct value writes repeat the check after app validation; keyboard fallback
+checks before dispatch and each new key-down. Key-up and held-input cleanup do
+not inherit the review, and its lifetime ends before post-action snapshots.
+Changed-focus, cancellation-during-review, and review-lifetime regressions pass:
+27 selected Swift tests passed. These are inert dispatch tests, not native focus
+acceptance. General press-key shortcuts, coordinate/activation targets, typed
+effect assessment, and prepare/execute authorization remain open. Rebuild and
+restage the helper before accepting these changes in the packaged app.
+
+Shortcut dispatch now uses the same per-key-down review scope. Snapshots retain
+bounded window identity alongside focused-control identity. A shortcut refuses
+changed windows, changed metadata, and focus appearing or disappearing since
+inspection. Window-level navigation remains available when both inspected and
+current focus are absent. Cleanup releases still bypass target review. The full
+Swift suite passed after this change; native window/focus acceptance and effect
+authorization remain outstanding. This helper must be restaged and rebundled.
+
+Activation-only indexed clicks now carry the cached control review through each
+AXRaise, AXMain, and AXFocused mutation, after app identity validation. The
+callback is required by the activation helpers, so this fallback cannot silently
+omit target review. The full Swift suite passed: 208 executed, one opt-in test
+skipped, zero failures. This closes the activation fallback omission, not the
+remaining coordinate/mouse or consequential-effect authorization work. Native
+acceptance requires the restaged helper in a rebuilt desktop app.
+
+Indexed mouse click dispatch now retains a mutation-local target review across
+public targeted, private targeted, and global paths. Each mouse-down rechecks
+cached identity and unchanged control bounds; mouse-up and cleanup remain
+available after the target changes. The review is also checked before preparing
+the input operation and cancellation is checked after review. Two inert tests
+cover all three delivery routes, a changed target before a second click,
+cancellation during review, and review lifetime. Full Swift validation passed:
+210 executed, one opt-in test skipped, zero failures. This is indexed mouse
+coverage, not raw-coordinate/drag semantic authorization or native acceptance.
+The helper must be rebuilt and restaged again before packaged verification.
+
+Native AX hit-testing now treats its input as window points. Both callers
+already supplied converted window coordinates; applying screenshot scaling a
+second time could select another control on Retina captures. The call now uses
+window-to-global translation directly. Full Swift validation passed (210 tests,
+one opt-in skip, zero failures). Native Retina hit-test acceptance is still open.
+
+Accessibility click fallback sequences now retain the original requested control
+review at each AX mutation, in addition to the chosen descendant/list/row target
+review. Nested scopes retain their outer checks and restore them on return or
+failure. This prevents an unchanged child from receiving a fallback when its
+original source changed. An inert regression covers unsupported first action,
+changed source, blocked fallback, and scope cleanup. Full Swift suite: 211 tests,
+one opt-in skip, zero failures. Native acceptance and restaging remain open.
+
+Coordinate click dispatch now requires its hit-tested Accessibility object to
+exist in the inspected snapshot. A mutation-local review checks its cached
+identity, unchanged bounds, and current hit-test identity before Accessibility
+mutations and mouse-down delivery. A replacement overlay or uninspected target
+requires fresh inspection instead of implicitly gaining input authorization.
+The same review spans AX-to-mouse fallback. This does not assess consequential
+effects, authorize arbitrary canvas controls, or validate drag destinations.
+A regression blocks mouse fallback when an unsupported AX action replaces the
+coordinate target. Swift validation and native acceptance are tracked separately;
+the helper must be restaged before a packaged app can contain this change.
+
+Validation: the full Swift suite passed after the coordinate-review change: 212 tests, one opt-in test skipped, zero failures. Native acceptance is outstanding.
+
+Control identity capture now includes AXURL, accepting native URL and string
+representations with the same bounded in-memory evidence. Changing or removing
+a link destination invalidates the inspected target even if its label remains
+unchanged. Unsupported URL attributes remain valid for non-link controls;
+unreadable, malformed, or oversized attributes cannot establish identity.
+Regression coverage compares native URL/string representations and rejects
+changed, removed, malformed, and oversized destinations. This is destination
+identity checking, not host-side authorization of a link's effects.
+
+Validation: the full Swift suite passed with 213 tests, one opt-in skip, zero failures. Native link acceptance remains open.
+
+Drag initiation now resolves source and destination to inspected Accessibility
+controls and rechecks both after app validation immediately before mouse-down.
+Both use the coordinate target review and one screenshot-to-window conversion.
+The original source geometry is not enforced after movement begins, because
+movement itself may legitimately change it. A targeted/global inert regression
+changes the destination during app validation and confirms no mouse-down or
+dragged input is dispatched. Mid-gesture destination changes, drop-effect
+assessment, and native drag acceptance remain outstanding; this is preflight
+and press-time validation only.
+
+Validation: full Swift suite passed with 214 tests, one opt-in skip, zero failures. Restaging and native drag acceptance remain outstanding.
+
+Snapshots include an additive `taffy_observation` version-1 JSON text block for
+local typed decision clients. Capture-time labels and indices describe candidates;
+no field values or coordinates are exported. Secure controls are excluded. This
+is not authorization: existing app-bound target review still governs execution.

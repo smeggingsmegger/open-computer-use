@@ -43,6 +43,15 @@ public final class ComputerUseToolDispatcher {
         self.service = service
     }
 
+    func callBoundTool(name: String, arguments: [String: Any], identity: InstalledAppIdentity, cancellation: NativeOperationCancellation? = nil) throws -> ToolCallResult {
+        guard ["get_app_state", "click", "perform_secondary_action", "scroll", "drag", "type_text", "press_key", "set_value"].contains(name) else {
+            throw ComputerUseError.unsupportedTool(name)
+        }
+        var arguments = arguments
+        arguments["app"] = identity.bundlePath
+        return try service.withBoundApp(identity, cancellation: cancellation) { try callTool(name: name, arguments: arguments) }
+    }
+
     public func callTool(name: String, arguments: [String: Any]) throws -> ToolCallResult {
         switch name {
         case "list_apps":

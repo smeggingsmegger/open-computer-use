@@ -10,6 +10,12 @@ struct SkyLightActivationCommand: Equatable {
 
 struct SkyLightSyntheticFocusContext {
     let deactivateTarget: SkyLightActivationCommand
+    let targetIdentity: SnapshotProcessIdentity
+}
+
+func skyLightFocusTargetIsCurrent(identity: SnapshotProcessIdentity, current: SnapshotProcessIdentity,
+                                  windowID: CGWindowID, windowInfo: [[String: Any]]) -> Bool {
+    identity.matches(current) && skyClickWindowMatchesTarget(windowInfo: windowInfo, windowID: windowID, pid: identity.pid)
 }
 
 struct SkyLightSyntheticFocusPlan: Equatable {
@@ -133,7 +139,9 @@ final class SkyLightSPI: @unchecked Sendable {
             throw unavailableError()
         }
 
-        postToPidFunction(pid, opaquePointer(for: event))
+        try NativeInputGuard.postPrivate(event, pid: pid) { event, target in
+            postToPidFunction(target, self.opaquePointer(for: event))
+        }
     }
 
     func setIntegerField(_ event: CGEvent, field: UInt32, value: Int64) throws {
@@ -156,6 +164,7 @@ final class SkyLightSPI: @unchecked Sendable {
         targetPID: pid_t,
         targetWindowID: CGWindowID
     ) throws -> SkyLightSyntheticFocusContext {
+        let targetIdentity = SnapshotProcessIdentity.read(pid: targetPID)
         guard let getProcessForPIDFunction else {
             throw unavailableError()
         }
@@ -174,16 +183,17 @@ final class SkyLightSPI: @unchecked Sendable {
             targetPSN: targetPSN,
             targetWindowID: targetWindowID
         )
-        try postActivationCommand(plan.activateTarget)
+        try postActivationCommand(plan.activateTarget, identity: targetIdentity)
         Thread.sleep(forTimeInterval: 0.040)
 
         return SkyLightSyntheticFocusContext(
-            deactivateTarget: plan.deactivateTarget
+            deactivateTarget: plan.deactivateTarget,
+            targetIdentity: targetIdentity
         )
     }
 
     func endSyntheticTargetFocus(_ context: SkyLightSyntheticFocusContext) throws {
-        try postActivationCommand(context.deactivateTarget)
+        try postActivationCommand(context.deactivateTarget, identity: context.targetIdentity)
         Thread.sleep(forTimeInterval: 0.040)
     }
 
@@ -197,7 +207,13 @@ final class SkyLightSPI: @unchecked Sendable {
         Unmanaged.passUnretained(event).toOpaque()
     }
 
-    private func postActivationCommand(_ command: SkyLightActivationCommand) throws {
+    private func postActivationCommand(_ command: SkyLightActivationCommand, identity: SnapshotProcessIdentity) throws {
+        try NativeInputGuard.validate(pid: identity.pid)
+        let windows = CGWindowListCopyWindowInfo([.optionIncludingWindow], command.windowID) as? [[String: Any]] ?? []
+        guard skyLightFocusTargetIsCurrent(identity: identity, current: SnapshotProcessIdentity.read(pid: identity.pid),
+                                          windowID: command.windowID, windowInfo: windows) else {
+            throw ComputerUseError.stateUnavailable("The synthetic focus target changed or exited. Inspect the approved app again.")
+        }
         guard let postEventRecordFunction else {
             throw unavailableError()
         }

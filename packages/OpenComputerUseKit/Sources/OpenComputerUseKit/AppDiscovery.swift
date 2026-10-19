@@ -7,6 +7,15 @@ public struct RunningAppDescriptor {
     public let bundleIdentifier: String?
     public let pid: pid_t
     public let runningApplication: NSRunningApplication
+    let snapshotProcessIdentity: SnapshotProcessIdentity
+
+    public init(name: String, bundleIdentifier: String?, pid: pid_t, runningApplication: NSRunningApplication) {
+        self.name = name
+        self.bundleIdentifier = bundleIdentifier
+        self.pid = pid
+        self.runningApplication = runningApplication
+        self.snapshotProcessIdentity = SnapshotProcessIdentity(runningApplication)
+    }
 }
 
 struct ListedAppDescriptor {
@@ -360,8 +369,9 @@ enum AppDiscovery {
         return nil
     }
 
-    private static func openApplication(at appURL: URL) throws {
+    static func openApplication(at appURL: URL, activate: Bool = true) throws {
         let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = activate
         let semaphore = DispatchSemaphore(value: 0)
         let errorBox = LaunchErrorBox()
 

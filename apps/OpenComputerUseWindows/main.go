@@ -67,6 +67,8 @@ func (f frame) renderedLocalFrame() string {
 }
 
 type elementRecord struct {
+	DecisionEditable bool `json:"decisionEditable,omitempty"`
+	DecisionProtected bool `json:"decisionProtected,omitempty"`
 	Index                int      `json:"index"`
 	RuntimeID            []int    `json:"runtimeId,omitempty"`
 	AutomationID         string   `json:"automationId,omitempty"`
@@ -120,6 +122,18 @@ func (s *appSnapshot) renderedText() string {
 func (s *appSnapshot) result() toolCallResult {
 	result := toolCallResult{
 		Content: []contentItem{{Type: "text", Text: s.renderedText()}},
+	}
+	if s != nil {
+		controls := []map[string]any{}
+		for _, record := range s.Elements {
+			role := strings.ToLower(record.ControlType)
+			if record.DecisionProtected || strings.Contains(role, "password") || strings.Contains(role, "secure") { continue }
+			label := []rune(record.Name)
+			if len(label) > 240 { label = label[:240] }
+			controls = append(controls, map[string]any{"index": record.Index, "role": record.ControlType, "name": string(label), "actions": record.Actions, "editable": record.DecisionEditable})
+		}
+		encoded, err := json.Marshal(map[string]any{"taffy_observation": map[string]any{"version": 1, "window": s.WindowTitle, "elements": controls}})
+		if err == nil { result.Content = append(result.Content, contentItem{Type:"text", Text:string(encoded)}) }
 	}
 	if s != nil && s.ScreenshotPNGBase64 != "" {
 		result.Content = append(result.Content, contentItem{

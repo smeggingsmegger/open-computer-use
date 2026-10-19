@@ -447,9 +447,25 @@ func shouldPreferContainingWebRowAXClickCandidate(
 }
 
 public final class ComputerUseService {
-    private var snapshotsByApp: [String: AppSnapshot] = [:]
+    private var snapshotCache = AppSnapshotCache()
+    private var boundApp: BoundAppIdentity?
+    private var boundInputApp: RunningAppDescriptor?
 
     public init() {}
+
+    func withBoundApp<T>(_ identity: InstalledAppIdentity, cancellation: NativeOperationCancellation? = nil, operation: () throws -> T) throws -> T {
+        try cancellation?.check()
+        guard boundApp == nil else { throw ComputerUseError.stateUnavailable("An app-bound operation is already active.") }
+        let binding = try BoundAppIdentity(identity)
+        boundApp = binding
+        defer { boundApp = nil; boundInputApp = nil }
+        return try NativeInputGuard.withValidation({ [self] pid in
+            guard let app = boundInputApp, app.pid == pid else {
+                throw ComputerUseError.permissionDenied("Input no longer targets the inspected app. Inspect the approved app again.")
+            }
+            try binding.validate(app)
+        }, cancellation: cancellation, operation: operation)
+    }
 
     public func listApps() -> ToolCallResult {
         ToolCallResult.text(
@@ -464,7 +480,8 @@ public final class ComputerUseService {
         textLimit: SnapshotTextLimit = .defaults,
         treeLimits: AccessibilityTreeLimits = .defaults
     ) throws -> ToolCallResult {
-        snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits), style: .fullState)
+        let app = try boundApp?.resolveForInspection() ?? AppDiscovery.resolve(query)
+        return snapshotResult(for: try refreshSnapshot(for: query, resolvedApp: app, textLimit: textLimit, treeLimits: treeLimits), style: .fullState)
     }
 
     public func click(
@@ -544,13 +561,17 @@ public final class ComputerUseService {
                         includeNearbyHitTesting: true,
                         allowActivationFallback: true
                     )) {
-                        try performNonAXClickFallback(
-                            at: targetPoint,
-                            button: button,
-                            clickCount: clickCount,
-                            targetDescription: "element_index=\(elementIndex)",
-                            snapshot: snapshot
-                        )
+                        try NativeInputGuard.withMouseTargetReview({
+                            try self.revalidateIndexedMouseTarget(record, snapshot: snapshot)
+                        }) {
+                            try performNonAXClickFallback(
+                                at: targetPoint,
+                                button: button,
+                                clickCount: clickCount,
+                                targetDescription: "element_index=\(elementIndex)",
+                                snapshot: snapshot
+                            )
+                        }
                     }
                 case .accessibility:
                     guard try performAXClickSequence(
@@ -566,15 +587,19 @@ public final class ComputerUseService {
                         )
                     }
                 case .appPost, .skyClick, .global:
-                    try performExplicitMouseClick(
-                        method: clickMethod,
-                        at: targetPoint,
-                        windowPoint: windowPoint,
-                        button: button,
-                        clickCount: clickCount,
-                        targetDescription: "element_index=\(elementIndex)",
-                        snapshot: snapshot
-                    )
+                    try NativeInputGuard.withMouseTargetReview({
+                        try self.revalidateIndexedMouseTarget(record, snapshot: snapshot)
+                    }) {
+                        try performExplicitMouseClick(
+                            method: clickMethod,
+                            at: targetPoint,
+                            windowPoint: windowPoint,
+                            button: button,
+                            clickCount: clickCount,
+                            targetDescription: "element_index=\(elementIndex)",
+                            snapshot: snapshot
+                        )
+                    }
                 }
             } catch {
                 settleVisualCursor(at: cursorTarget)
@@ -592,48 +617,53 @@ public final class ComputerUseService {
                 targetWindowLayer: snapshot.targetWindowLayer
             )
 
+            let reviewTarget = try coordinateTargetReview(at: point, snapshot: snapshot)
             moveVisualCursor(to: cursorTarget)
 
             do {
-                switch clickMethod {
-                case .auto:
-                    let candidates = try clickCandidates(at: point, in: snapshot)
-                    var handled = false
-                    for record in candidates {
-                        if try performAXClickSequence(
-                            on: record,
-                            snapshot: snapshot,
-                            button: button,
-                            clickCount: clickCount,
-                            includeNearbyHitTesting: false,
-                            allowActivationFallback: false
-                        ) {
-                            handled = true
-                            break
+                try NativeInputGuard.withAccessibilityTargetReview(reviewTarget) {
+                    try NativeInputGuard.withMouseTargetReview(reviewTarget) {
+                        switch clickMethod {
+                        case .auto:
+                            let candidates = try clickCandidates(at: point, in: snapshot)
+                            var handled = false
+                            for record in candidates {
+                                if try performAXClickSequence(
+                                    on: record,
+                                    snapshot: snapshot,
+                                    button: button,
+                                    clickCount: clickCount,
+                                    includeNearbyHitTesting: false,
+                                    allowActivationFallback: false
+                                ) {
+                                    handled = true
+                                    break
+                                }
+                            }
+
+                            if !handled {
+                                try performNonAXClickFallback(
+                                    at: targetPoint,
+                                    button: button,
+                                    clickCount: clickCount,
+                                    targetDescription: "x=\(Int(screenshotPoint.x)) y=\(Int(screenshotPoint.y))",
+                                    snapshot: snapshot
+                                )
+                            }
+                        case .accessibility:
+                            throw ComputerUseError.message("click_method 'accessibility' requires element_index")
+                        case .appPost, .skyClick, .global:
+                            try performExplicitMouseClick(
+                                method: clickMethod,
+                                at: targetPoint,
+                                windowPoint: point,
+                                button: button,
+                                clickCount: clickCount,
+                                targetDescription: "x=\(Int(screenshotPoint.x)) y=\(Int(screenshotPoint.y))",
+                                snapshot: snapshot
+                            )
                         }
                     }
-
-                    if !handled {
-                        try performNonAXClickFallback(
-                            at: targetPoint,
-                            button: button,
-                            clickCount: clickCount,
-                            targetDescription: "x=\(Int(screenshotPoint.x)) y=\(Int(screenshotPoint.y))",
-                            snapshot: snapshot
-                        )
-                    }
-                case .accessibility:
-                    throw ComputerUseError.message("click_method 'accessibility' requires element_index")
-                case .appPost, .skyClick, .global:
-                    try performExplicitMouseClick(
-                        method: clickMethod,
-                        at: targetPoint,
-                        windowPoint: point,
-                        button: button,
-                        clickCount: clickCount,
-                        targetDescription: "x=\(Int(screenshotPoint.x)) y=\(Int(screenshotPoint.y))",
-                        snapshot: snapshot
-                    )
                 }
             } catch {
                 settleVisualCursor(at: cursorTarget)
@@ -674,7 +704,9 @@ public final class ComputerUseService {
             throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
         }
 
-        let result = AXUIElementPerformAction(element, rawAction as CFString)
+        let result = try NativeInputGuard.performAction(element, rawAction as CFString, revalidateTarget: {
+            try self.revalidateIndexedControl(record)
+        })
         guard result == .success else {
             throw ComputerUseError.message("AXUIElementPerformAction failed with \(result.rawValue)")
         }
@@ -708,7 +740,9 @@ public final class ComputerUseService {
            let rawAction = record.rawActions.first(where: { $0.caseInsensitiveCompare("AXScroll\(normalized.capitalized)ByPage") == .orderedSame }),
            let element = record.element {
             for _ in 0..<repeatCount {
-                _ = AXUIElementPerformAction(element, rawAction as CFString)
+                _ = try NativeInputGuard.performAction(element, rawAction as CFString, revalidateTarget: {
+                    try self.revalidateIndexedControl(record)
+                })
                 Thread.sleep(forTimeInterval: 0.05)
             }
         } else if let point = try globalPoint(for: record, snapshot: snapshot) {
@@ -734,14 +768,26 @@ public final class ComputerUseService {
             return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
         }
 
-        let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
-        let end = try screenshotToGlobalPoint(snapshot: snapshot, x: toX, y: toY)
-        let path = try performDragEvent(
-            from: start,
-            to: end,
-            targetDescription: "from=(\(Int(fromX)), \(Int(fromY))) to=(\(Int(toX)), \(Int(toY)))",
-            snapshot: snapshot
-        )
+        let sourcePoint = screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: CGPoint(x: fromX, y: fromY))
+        let destinationPoint = screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: CGPoint(x: toX, y: toY))
+        let reviewSource = try coordinateTargetReview(at: sourcePoint, snapshot: snapshot)
+        let reviewDestination = try coordinateTargetReview(at: destinationPoint, snapshot: snapshot)
+        let start = try windowPointToGlobalPoint(snapshot: snapshot, point: sourcePoint)
+        let end = try windowPointToGlobalPoint(snapshot: snapshot, point: destinationPoint)
+        // Recheck both inspected endpoints after app validation at mouse-down.
+        // The source may move as a result of dragging, so do not require its
+        // original geometry during movement or release-only cleanup.
+        let path = try NativeInputGuard.withMouseTargetReview({
+            try reviewSource()
+            try reviewDestination()
+        }) {
+            try performDragEvent(
+                from: start,
+                to: end,
+                targetDescription: "from=(\(Int(fromX)), \(Int(fromY))) to=(\(Int(toX)), \(Int(toY)))",
+                snapshot: snapshot
+            )
+        }
         return appendingDragDeliveryNote(
             to: snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult),
             path: path
@@ -756,6 +802,7 @@ public final class ComputerUseService {
             return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
         }
 
+        try revalidateFocusedControl(snapshot)
         if try typeTextBySettingFocusedValueIfAvailable(text, in: snapshot) {
             Thread.sleep(forTimeInterval: 0.1)
             return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
@@ -765,7 +812,11 @@ public final class ComputerUseService {
             throw ComputerUseError.stateUnavailable("type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element.")
         }
 
-        try InputSimulation.typeText(text, pid: snapshot.app.pid)
+        try NativeInputGuard.withKeyboardTargetReview({
+            try self.revalidateFocusedControl(snapshot)
+        }) {
+            try InputSimulation.typeText(text, pid: snapshot.app.pid)
+        }
         return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
@@ -777,7 +828,11 @@ public final class ComputerUseService {
             return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
         }
 
-        try InputSimulation.pressKey(key, pid: snapshot.app.pid)
+        try NativeInputGuard.withKeyboardTargetReview({
+            try self.revalidateKeyboardTarget(snapshot)
+        }) {
+            try InputSimulation.pressKey(key, pid: snapshot.app.pid)
+        }
         return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
@@ -810,7 +865,9 @@ public final class ComputerUseService {
         moveVisualCursor(to: cursorTarget)
 
         do {
-            let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
+            let result = try NativeInputGuard.setAttribute(element, kAXValueAttribute as CFString, value as CFString, revalidateTarget: {
+                try self.revalidateIndexedControl(record)
+            })
             guard result == .success else {
                 throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(result.rawValue)")
             }
@@ -826,21 +883,25 @@ public final class ComputerUseService {
     }
 
     private func currentSnapshot(for query: String) throws -> AppSnapshot {
-        if let snapshot = snapshotsByApp[query.lowercased()] {
-            return snapshot
-        }
-
-        return try refreshSnapshot(for: query)
+        let snapshot = try snapshotCache.require(query, isCurrent: snapshotAppIsCurrent)
+        try boundApp?.validate(snapshot.app)
+        if boundApp != nil { boundInputApp = snapshot.app }
+        return snapshot
     }
 
     @discardableResult
     private func refreshSnapshot(
         for query: String,
+        resolvedApp: RunningAppDescriptor? = nil,
         textLimit: SnapshotTextLimit = .defaults,
         treeLimits: AccessibilityTreeLimits = .defaults,
         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation
     ) throws -> AppSnapshot {
-        let app = try AppDiscovery.resolve(query)
+        // Action-result capture stays with the inspected process. Only an
+        // explicit get_app_state may resolve a name or launch an application.
+        let app = try resolvedApp ?? currentSnapshot(for: query).app
+        try boundApp?.validate(app)
+        if boundApp != nil { boundInputApp = app }
         let snapshot = try SnapshotBuilder.build(
             for: app,
             textLimit: textLimit,
@@ -848,15 +909,7 @@ public final class ComputerUseService {
             recoveryPolicy: recoveryPolicy
         )
 
-        let keys = Set([
-            query.lowercased(),
-            app.name.lowercased(),
-            (app.bundleIdentifier ?? "").lowercased(),
-        ].filter { !$0.isEmpty })
-
-        for key in keys {
-            snapshotsByApp[key] = snapshot
-        }
+        snapshotCache.store(snapshot, query: query)
 
         return snapshot
     }
@@ -866,7 +919,48 @@ public final class ComputerUseService {
             throw ComputerUseError.invalidArguments("unknown element_index '\(index)'")
         }
 
+        if boundApp != nil, snapshot.mode == .accessibility, let element = record.element {
+            try ElementIdentityEvidence.requireCurrent(record.identityEvidence) {
+                ElementIdentityEvidence.capture(element)
+            }
+        }
         return record
+    }
+
+    // Run inside the dispatch guard, after app validation. Lookup alone leaves
+    // time for the app to recycle a control while preparing the action.
+    private func revalidateIndexedControl(_ record: ElementRecord) throws {
+        guard boundApp != nil else { return }
+        try ElementIdentityEvidence.requireCurrent(record.identityEvidence) {
+            record.element.flatMap { ElementIdentityEvidence.capture($0) }
+        }
+    }
+
+    // A coordinate must still hit a control from the inspected snapshot. A
+    // fresh hit-test alone would authorize a replacement overlay implicitly.
+    private func coordinateTargetReview(at point: CGPoint, snapshot: AppSnapshot) throws -> () throws -> Void {
+        guard boundApp != nil else { return {} }
+        guard let hit = try hitTestElement(at: point, in: snapshot),
+              let observed = snapshot.elements.values.first(where: { sameElement($0.element, hit.element) }) else {
+            throw ComputerUseError.stateUnavailable("The coordinate target was not present in the inspected controls. Run get_app_state and select the current target before acting.")
+        }
+        return {
+            try self.revalidateIndexedMouseTarget(observed, snapshot: snapshot)
+            guard let current = try self.hitTestElement(at: point, in: snapshot),
+                  self.sameElement(observed.element, current.element) else {
+                throw ComputerUseError.stateUnavailable("A different control now occupies the target location. Run get_app_state and review the current target before acting.")
+            }
+        }
+    }
+
+    private func revalidateIndexedMouseTarget(_ record: ElementRecord, snapshot: AppSnapshot) throws {
+        guard boundApp != nil else { return }
+        try revalidateIndexedControl(record)
+        guard let element = record.element, let observed = record.localFrame,
+              let current = localFrame(of: element, windowBounds: snapshot.windowBounds),
+              observed == current else {
+            throw ComputerUseError.stateUnavailable("The inspected click target moved or its bounds are unavailable. Run get_app_state and review the current target before clicking.")
+        }
     }
 
     func matchingAction(requested: String, record: ElementRecord) -> String? {
@@ -893,24 +987,32 @@ public final class ComputerUseService {
         case .left:
             if clickCount <= 1,
                !hasAncestorRole("AXWebArea", of: element),
-               try selectContainingListItem(for: element)
+               try selectContainingListItem(for: element, record: record)
             {
                 return true
             }
 
-            if try performAction(named: kAXPressAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if try performAction(named: kAXPressAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount, revalidateTarget: {
+                try self.revalidateIndexedControl(record)
+            }) {
                 return true
             }
 
-            if try performAction(named: kAXConfirmAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if try performAction(named: kAXConfirmAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount, revalidateTarget: {
+                try self.revalidateIndexedControl(record)
+            }) {
                 return true
             }
 
-            if try performAction(named: "AXOpen", on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if try performAction(named: "AXOpen", on: element, availableActions: record.rawActions, repeatCount: clickCount, revalidateTarget: {
+                try self.revalidateIndexedControl(record)
+            }) {
                 return true
             }
         case .right:
-            if try performAction(named: kAXShowMenuAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if try performAction(named: kAXShowMenuAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount, revalidateTarget: {
+                try self.revalidateIndexedControl(record)
+            }) {
                 return true
             }
         case .middle:
@@ -946,15 +1048,27 @@ public final class ComputerUseService {
         return CFEqual(lhs, rhs)
     }
 
-    private func selectContainingListItem(for element: AXUIElement) throws -> Bool {
+    private func selectContainingListItem(for element: AXUIElement, record: ElementRecord) throws -> Bool {
         guard let target = selectableListItem(containing: element) else {
             return false
         }
 
-        let result = AXUIElementSetAttributeValue(
+        let listEvidence = ElementIdentityEvidence.capture(target.list)
+        let itemEvidence = ElementIdentityEvidence.capture(target.item)
+        let result = try NativeInputGuard.setAttribute(
             target.list,
             kAXSelectedChildrenAttribute as CFString,
-            [target.item] as CFArray
+            [target.item] as CFArray,
+            revalidateTarget: {
+                guard self.boundApp != nil else { return }
+                try self.revalidateIndexedControl(record)
+                try ElementIdentityEvidence.requireCurrent(listEvidence) { ElementIdentityEvidence.capture(target.list) }
+                try ElementIdentityEvidence.requireCurrent(itemEvidence) { ElementIdentityEvidence.capture(target.item) }
+                guard let current = self.selectableListItem(containing: element),
+                      CFEqual(current.list, target.list), CFEqual(current.item, target.item) else {
+                    throw ComputerUseError.stateUnavailable("The inspected list target changed. Run get_app_state and review the current target before acting.")
+                }
+            }
         )
 
         switch result {
@@ -991,6 +1105,24 @@ public final class ComputerUseService {
     }
 
     private func performAXClickSequence(
+        on record: ElementRecord,
+        snapshot: AppSnapshot,
+        button: MouseButtonKind,
+        clickCount: Int,
+        includeNearbyHitTesting: Bool,
+        allowActivationFallback: Bool
+    ) throws -> Bool {
+        try NativeInputGuard.withAccessibilityTargetReview({
+            try self.revalidateIndexedControl(record)
+        }) {
+            try performReviewedAXClickSequence(on: record, snapshot: snapshot,
+                button: button, clickCount: clickCount,
+                includeNearbyHitTesting: includeNearbyHitTesting,
+                allowActivationFallback: allowActivationFallback)
+        }
+    }
+
+    private func performReviewedAXClickSequence(
         on record: ElementRecord,
         snapshot: AppSnapshot,
         button: MouseButtonKind,
@@ -1067,7 +1199,9 @@ public final class ComputerUseService {
             return false
         }
 
-        if try activateClickTarget(element: element, availableActions: record.rawActions) {
+        if try activateClickTarget(element: element, availableActions: record.rawActions, revalidateTarget: {
+            try self.revalidateIndexedControl(record)
+        }) {
             debugClickDecision("handled by activation fallback \(clickDebugDescription(record))")
             Thread.sleep(forTimeInterval: 0.15)
             return true
@@ -1076,14 +1210,14 @@ public final class ComputerUseService {
         return false
     }
 
-    private func performAction(named action: String, on element: AXUIElement, availableActions: [String], repeatCount: Int = 1) throws -> Bool {
+    private func performAction(named action: String, on element: AXUIElement, availableActions: [String], repeatCount: Int = 1, revalidateTarget: () throws -> Void = {}) throws -> Bool {
         guard availableActions.contains(where: { $0.caseInsensitiveCompare(action) == .orderedSame }) else {
             return false
         }
 
         let attempts = max(repeatCount, 1)
         for index in 0..<attempts {
-            let result = AXUIElementPerformAction(element, action as CFString)
+            let result = try NativeInputGuard.performAction(element, action as CFString, revalidateTarget: revalidateTarget)
             switch result {
             case .success:
                 if index < attempts - 1 {
@@ -1101,26 +1235,26 @@ public final class ComputerUseService {
         return true
     }
 
-    private func activateClickTarget(element: AXUIElement, availableActions: [String]) throws -> Bool {
+    private func activateClickTarget(element: AXUIElement, availableActions: [String], revalidateTarget: () throws -> Void) throws -> Bool {
         var activated = false
 
-        if try performAction(named: kAXRaiseAction as String, on: element, availableActions: availableActions) {
+        if try performAction(named: kAXRaiseAction as String, on: element, availableActions: availableActions, revalidateTarget: revalidateTarget) {
             activated = true
         }
 
-        if try setBoolAttribute(named: kAXMainAttribute, on: element) {
+        if try setBoolAttribute(named: kAXMainAttribute, on: element, revalidateTarget: revalidateTarget) {
             activated = true
         }
 
-        if try setBoolAttribute(named: kAXFocusedAttribute, on: element) {
+        if try setBoolAttribute(named: kAXFocusedAttribute, on: element, revalidateTarget: revalidateTarget) {
             activated = true
         }
 
         return activated
     }
 
-    private func setBoolAttribute(named attribute: String, on element: AXUIElement) throws -> Bool {
-        let result = AXUIElementSetAttributeValue(element, attribute as CFString, kCFBooleanTrue)
+    private func setBoolAttribute(named attribute: String, on element: AXUIElement, revalidateTarget: () throws -> Void) throws -> Bool {
+        let result = try NativeInputGuard.setAttribute(element, attribute as CFString, kCFBooleanTrue, revalidateTarget: revalidateTarget)
         switch result {
         case .success:
             return true
@@ -1162,9 +1296,11 @@ public final class ComputerUseService {
             .first
     }
 
-    private func hitTestElement(at point: CGPoint, in snapshot: AppSnapshot) throws -> ElementRecord? {
+    private func hitTestElement(at windowPoint: CGPoint, in snapshot: AppSnapshot) throws -> ElementRecord? {
         let appElement = AXUIElementCreateApplication(snapshot.app.pid)
-        let globalPoint = try screenshotToGlobalPoint(snapshot: snapshot, x: Double(point.x), y: Double(point.y))
+        // Callers already converted screenshot pixels (or start with AX window
+        // points). Applying Retina scaling again hit-tests a different control.
+        let globalPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: windowPoint)
         var hitElement: AXUIElement?
         let result = AXUIElementCopyElementAtPosition(appElement, Float(globalPoint.x), Float(globalPoint.y), &hitElement)
         guard result == .success, let hitElement else {
@@ -1342,7 +1478,10 @@ public final class ComputerUseService {
 
             if isLikelyContainingWebRowAction(targetFrame: targetFrame, candidate: candidate),
                !isLikelySyntheticSideAction(candidate, in: record),
-               try performAction(named: kAXPressAction as String, on: parent, availableActions: rawActions)
+               try performAction(named: kAXPressAction as String, on: parent, availableActions: rawActions, revalidateTarget: {
+                   try self.revalidateIndexedControl(record)
+                   try self.revalidateIndexedControl(candidate)
+               })
             {
                 debugClickDecision("handled by containing web row \(clickDebugDescription(candidate))")
                 return true
@@ -1399,6 +1538,35 @@ public final class ComputerUseService {
         }
     }
 
+    private func revalidateKeyboardTarget(_ snapshot: AppSnapshot) throws {
+        guard boundApp != nil else { return }
+        guard let observedWindow = snapshot.inputWindow,
+              let currentWindow = SnapshotBuilder.currentInputWindow(pid: snapshot.app.pid),
+              CFEqual(observedWindow, currentWindow) else {
+            throw ComputerUseError.stateUnavailable("The inspected window changed. Run get_app_state and review the current keyboard target.")
+        }
+        try ElementIdentityEvidence.requireCurrent(snapshot.inputWindowIdentity) {
+            ElementIdentityEvidence.capture(currentWindow)
+        }
+        let currentFocus = SnapshotBuilder.currentFocusedElement(pid: snapshot.app.pid)
+        // Window-level shortcuts remain usable without a focused control, but
+        // a newly focused field must not silently receive an old shortcut.
+        if snapshot.focusedElement == nil && currentFocus == nil { return }
+        try revalidateFocusedControl(snapshot)
+    }
+
+    private func revalidateFocusedControl(_ snapshot: AppSnapshot) throws {
+        guard boundApp != nil else { return }
+        guard let observed = snapshot.focusedElement,
+              let current = SnapshotBuilder.currentFocusedElement(pid: snapshot.app.pid),
+              CFEqual(observed, current) else {
+            throw ComputerUseError.stateUnavailable("The focused control changed. Run get_app_state and review the current text entry target before typing.")
+        }
+        try ElementIdentityEvidence.requireCurrent(snapshot.focusedIdentity) {
+            ElementIdentityEvidence.capture(current)
+        }
+    }
+
     private func typeTextBySettingFocusedValueIfAvailable(_ text: String, in snapshot: AppSnapshot) throws -> Bool {
         guard let element = snapshot.focusedElement else {
             return false
@@ -1409,7 +1577,9 @@ public final class ComputerUseService {
         }
 
         let baseValue = editableBaseValue(for: element)
-        let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, (baseValue + text) as CFString)
+        let result = try NativeInputGuard.setAttribute(element, kAXValueAttribute as CFString, (baseValue + text) as CFString, revalidateTarget: {
+            try self.revalidateFocusedControl(snapshot)
+        })
         switch result {
         case .success:
             return true
@@ -1797,7 +1967,7 @@ public final class ComputerUseService {
                 targetDescription: targetDescription,
                 snapshot: snapshot
             )
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
             try InputSimulation.scrollGlobally(at: eventPoint, direction: direction, pages: pages)
             return
         }
@@ -1822,7 +1992,7 @@ public final class ComputerUseService {
                 targetDescription: targetDescription,
                 snapshot: snapshot
             )
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
             try InputSimulation.dragGlobally(from: eventStart, to: eventEnd)
         case .appPost:
             try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, pid: snapshot.app.pid)
@@ -1846,26 +2016,20 @@ public final class ComputerUseService {
                 targetDescription: targetDescription,
                 snapshot: snapshot
             )
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
             try InputSimulation.clickGlobally(at: eventPoint, button: button, clickCount: clickCount)
             return
         }
 
-        do {
-            try InputSimulation.clickTargeted(
-                at: eventPoint,
-                button: button,
-                clickCount: clickCount,
-                pid: snapshot.app.pid
-            )
-            return
-        } catch {
-            guard globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) else {
-                throw ComputerUseError.message(
-                    "click could not be handled through accessibility, and global pointer fallback is disabled. Set OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 to allow physical-pointer fallback for this process."
-                )
-            }
-        }
+        // The selected delivery path already reflects the host's permission.
+        // Preserve identity, cancellation, and dispatch errors instead of
+        // replacing them with advice to enable broader pointer access.
+        try InputSimulation.clickTargeted(
+            at: eventPoint,
+            button: button,
+            clickCount: clickCount,
+            pid: snapshot.app.pid
+        )
     }
 
     private func performExplicitMouseClick(
@@ -1910,7 +2074,7 @@ public final class ComputerUseService {
                 )
             }
             debugClickDecision("requested=global executed=global_hid target=\(targetDescription)")
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
             try InputSimulation.clickGlobally(at: eventPoint, button: button, clickCount: clickCount)
         case .auto, .accessibility:
             throw ComputerUseError.message(
@@ -1921,6 +2085,9 @@ public final class ComputerUseService {
 
     private func snapshotResult(for snapshot: AppSnapshot, style: SnapshotTextStyle) -> ToolCallResult {
         var content = [ToolResultContentItem.text(snapshot.renderedText(style: style))]
+        if let observation = snapshot.decisionObservationJSON {
+            content.append(.text(observation))
+        }
         if let screenshotPNGData = snapshot.screenshotPNGData {
             content.append(.pngImage(screenshotPNGData))
         }

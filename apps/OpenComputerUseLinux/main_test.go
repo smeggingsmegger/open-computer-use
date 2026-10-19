@@ -383,3 +383,13 @@ func shortTempDir(t *testing.T) string {
 	})
 	return path
 }
+
+func TestDecisionObservationsExcludeSecretsAndGeometry(t *testing.T) {
+    snapshot := &appSnapshot{Elements: []elementRecord{
+        {Index: 1, Name: "Search", Value: "private field value", DecisionEditable: true},
+        {Index: 2, Name: "Secret", DecisionProtected: true},
+    }}
+    content := snapshot.result().Content
+    if len(content) < 2 || !strings.Contains(content[1].Text, "taffy_observation") { t.Fatal("missing structured observation") }
+    if strings.Contains(content[1].Text, "private field value") || strings.Contains(content[1].Text, "Secret") || strings.Contains(content[1].Text, "frame") { t.Fatal("private values or geometry leaked") }
+}

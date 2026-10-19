@@ -48,6 +48,8 @@ enum OpenComputerUseMain {
             } else {
                 try server.run()
             }
+        case .permissions:
+            print(PermissionDiagnostics.current().summary)
         case .doctor:
             let permissions = PermissionDiagnostics.current()
             print(permissions.summary)

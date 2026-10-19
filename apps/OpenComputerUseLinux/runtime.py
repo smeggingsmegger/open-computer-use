@@ -274,6 +274,8 @@ def record_for(node, index, path, window_bounds, text_limit=DEFAULT_TEXT_LIMIT):
     return {
         "index": index,
         "runtimeId": path[:],
+        "decisionEditable": supports_interface(node, "EditableText"),
+        "decisionProtected": "password" in role.lower(),
         "automationId": accessible_id(node),
         "name": limit_text(node_name(node), text_limit=text_limit),
         "controlType": role,

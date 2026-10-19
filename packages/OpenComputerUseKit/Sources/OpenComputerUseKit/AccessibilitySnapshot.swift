@@ -6,6 +6,7 @@ import ScreenCaptureKit
 
 final class ElementRecord {
     let index: Int
+    let decisionLabel: String?
     let identifier: String?
     let element: AXUIElement?
     let localFrame: CGRect?
@@ -13,6 +14,7 @@ final class ElementRecord {
     let rawActions: [String]
     let prettyActions: [String]
     let isSyntheticText: Bool
+    let identityEvidence: ElementIdentityEvidence?
 
     init(
         index: Int,
@@ -22,9 +24,11 @@ final class ElementRecord {
         role: String? = nil,
         rawActions: [String],
         prettyActions: [String],
-        isSyntheticText: Bool = false
+        isSyntheticText: Bool = false,
+        decisionLabel: String? = nil
     ) {
         self.index = index
+        self.decisionLabel = decisionLabel
         self.identifier = identifier
         self.element = element
         self.localFrame = localFrame
@@ -32,6 +36,7 @@ final class ElementRecord {
         self.rawActions = rawActions
         self.prettyActions = prettyActions
         self.isSyntheticText = isSyntheticText
+        self.identityEvidence = element.flatMap(ElementIdentityEvidence.capture)
     }
 }
 
@@ -113,6 +118,9 @@ public struct AppSnapshot {
     let treeLines: [String]
     let focusedSummary: String?
     let focusedElement: AXUIElement?
+    let focusedIdentity: ElementIdentityEvidence?
+    let inputWindow: AXUIElement?
+    let inputWindowIdentity: ElementIdentityEvidence?
     let selectedText: String?
 
     let elements: [Int: ElementRecord]
@@ -164,13 +172,13 @@ enum SnapshotBuilder {
         }
 
         let appElement = AXUIElementCreateApplication(app.pid)
-        enableBestEffortAccessibilityModes(appElement)
+        try enableBestEffortAccessibilityModes(appElement)
         let systemWide = AXUIElementCreateSystemWide()
         var focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
         var focusedWindow = preferredFocusedWindow(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
         if focusedWindow == nil,
            recoveryPolicy == .allowActivation,
-           recoverVisibleWindow(for: app, appElement: appElement, preferredWindow: nil) {
+           try recoverVisibleWindow(for: app, appElement: appElement, preferredWindow: nil) {
             focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
             focusedWindow = preferredFocusedWindow(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
         }
@@ -185,7 +193,7 @@ enum SnapshotBuilder {
         var windowCapture = WindowCapture.resolve(for: app.pid, titleHint: windowTitle)
         if windowCapture == nil,
            recoveryPolicy == .allowActivation,
-           recoverVisibleWindow(for: app, appElement: appElement, preferredWindow: rootWindow) {
+           try recoverVisibleWindow(for: app, appElement: appElement, preferredWindow: rootWindow) {
             focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
             if let recoveredWindow = preferredFocusedWindow(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide) {
                 rootWindow = recoveredWindow
@@ -225,6 +233,8 @@ enum SnapshotBuilder {
         let windowBounds = windowCapture.bounds
         let screenshotPNGData = windowCapture.pngDataIfAvailable()
         let focusedElement = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
+        let inputWindowIdentity = ElementIdentityEvidence.capture(rootElement)
+        let focusedIdentity = focusedElement.flatMap { ElementIdentityEvidence.capture($0) }
         let selectedText = focusedElement.flatMap { copySelectedText($0, textLimit: textLimit) }
         let context = RenderContext(
             windowBounds: windowBounds,
@@ -252,28 +262,33 @@ enum SnapshotBuilder {
             treeLines: renderer.lines,
             focusedSummary: renderer.focusedSummary,
             focusedElement: focusedElement,
+            focusedIdentity: focusedIdentity,
+            inputWindow: rootElement,
+            inputWindowIdentity: inputWindowIdentity,
             selectedText: selectedText,
             elements: renderer.records
         )
     }
 
-    private static func recoverVisibleWindow(for app: RunningAppDescriptor, appElement: AXUIElement, preferredWindow: AXUIElement?) -> Bool {
+    private static func recoverVisibleWindow(for app: RunningAppDescriptor, appElement: AXUIElement, preferredWindow: AXUIElement?) throws -> Bool {
         var recovered = false
 
         if let runningApplication = NSRunningApplication(processIdentifier: app.pid) {
+            try NativeInputGuard.validate(pid: app.pid)
             recovered = runningApplication.unhide() || recovered
+            try NativeInputGuard.validate(pid: app.pid)
             recovered = runningApplication.activate(options: [.activateAllWindows]) || recovered
         }
 
-        if let bundleIdentifier = app.bundleIdentifier {
+        if !NativeInputGuard.isActive, !NativeInputGuard.bindingRequired, let bundleIdentifier = app.bundleIdentifier {
             recovered = openBundleIdentifier(bundleIdentifier) || recovered
         }
 
         if let window = preferredWindow ?? firstAnyWindow(for: appElement) {
-            recovered = unminimize(window) || recovered
-            recovered = raise(window) || recovered
-            recovered = setBoolAttribute(named: kAXMainAttribute as String, on: window) || recovered
-            recovered = setBoolAttribute(named: kAXFocusedAttribute as String, on: window) || recovered
+            recovered = try unminimize(window) || recovered
+            recovered = try raise(window) || recovered
+            recovered = try setBoolAttribute(named: kAXMainAttribute as String, on: window) || recovered
+            recovered = try setBoolAttribute(named: kAXFocusedAttribute as String, on: window) || recovered
         }
 
         if recovered {
@@ -312,24 +327,24 @@ enum SnapshotBuilder {
             ?? copyArray(appElement, attribute: kAXWindowsAttribute)?.first(where: { stringValue(of: $0, attribute: kAXRoleAttribute) == kAXWindowRole as String })
     }
 
-    private static func unminimize(_ window: AXUIElement) -> Bool {
+    private static func unminimize(_ window: AXUIElement) throws -> Bool {
         guard boolValue(of: window, attribute: kAXMinimizedAttribute) == true else {
             return false
         }
 
-        return AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse) == .success
+        return try NativeInputGuard.setAttribute(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse) == .success
     }
 
-    private static func raise(_ window: AXUIElement) -> Bool {
+    private static func raise(_ window: AXUIElement) throws -> Bool {
         guard copyActions(window)?.contains(where: { $0.caseInsensitiveCompare(kAXRaiseAction as String) == .orderedSame }) == true else {
             return false
         }
 
-        return AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success
+        return try NativeInputGuard.performAction(window, kAXRaiseAction as CFString) == .success
     }
 
-    private static func setBoolAttribute(named attribute: String, on element: AXUIElement) -> Bool {
-        AXUIElementSetAttributeValue(element, attribute as CFString, kCFBooleanTrue) == .success
+    private static func setBoolAttribute(named attribute: String, on element: AXUIElement) throws -> Bool {
+        try NativeInputGuard.setAttribute(element, attribute as CFString, kCFBooleanTrue) == .success
     }
 
     private static func preferredFocusedWindow(appElement: AXUIElement, appPID: pid_t, focusedApplication: AXUIElement?, systemWide: AXUIElement) -> AXUIElement? {
@@ -355,6 +370,24 @@ enum SnapshotBuilder {
     private static func isUsableWindowElement(_ element: AXUIElement) -> Bool {
         stringValue(of: element, attribute: kAXRoleAttribute) == kAXWindowRole as String
             && boolValue(of: element, attribute: kAXMinimizedAttribute) != true
+    }
+
+    static func currentInputWindow(pid: pid_t) -> AXUIElement? {
+        let systemWide = AXUIElementCreateSystemWide()
+        return preferredFocusedWindow(
+            appElement: AXUIElementCreateApplication(pid), appPID: pid,
+            focusedApplication: copyElement(systemWide, attribute: kAXFocusedApplicationAttribute),
+            systemWide: systemWide
+        )
+    }
+
+    static func currentFocusedElement(pid: pid_t) -> AXUIElement? {
+        let systemWide = AXUIElementCreateSystemWide()
+        return preferredFocusedElement(
+            appElement: AXUIElementCreateApplication(pid), appPID: pid,
+            focusedApplication: copyElement(systemWide, attribute: kAXFocusedApplicationAttribute),
+            systemWide: systemWide
+        )
     }
 
     private static func preferredFocusedElement(appElement: AXUIElement, appPID: pid_t, focusedApplication: AXUIElement?, systemWide: AXUIElement) -> AXUIElement? {
@@ -388,7 +421,8 @@ enum SnapshotBuilder {
                 localFrame: element.frame.cgRect,
                 role: element.role,
                 rawActions: element.actions,
-                prettyActions: element.actions
+                prettyActions: element.actions,
+                decisionLabel: element.title ?? element.identifier
             )
             records[element.index] = record
 
@@ -408,18 +442,21 @@ enum SnapshotBuilder {
             treeLines: lines,
             focusedSummary: focusedSummary,
             focusedElement: nil,
+            focusedIdentity: nil,
+            inputWindow: nil,
+            inputWindowIdentity: nil,
             selectedText: nil,
             elements: records
         )
     }
 }
 
-private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) {
+private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) throws {
     // Chromium/Electron apps may withhold parts of their AX tree until manual
     // accessibility is enabled. These private attributes are best-effort and
     // harmlessly fail on apps that do not support them.
-    _ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-    _ = AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+    _ = try NativeInputGuard.setAttribute(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    _ = try NativeInputGuard.setAttribute(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
 }
 
 private struct WindowCapture {
@@ -844,7 +881,8 @@ private struct TreeRenderer {
             localFrame: localFrame,
             role: role,
             rawActions: actions,
-            prettyActions: prettyActions
+            prettyActions: prettyActions,
+            decisionLabel: displayTitle ?? label ?? placeholder ?? axIdentifier
         )
         records[index] = record
 

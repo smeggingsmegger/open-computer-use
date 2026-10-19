@@ -17,26 +17,96 @@ Avoid falling back to AppleScript during a computer use session. Prefer Computer
 Ask the user before taking destructive or externally visible actions such as sending, deleting, or purchasing. If helpful, you can ask follow-up questions before taking action to make sure you’re understanding the user’s request correctly.
 """
 
-public final class StdioMCPServer {
+// In run(), the lane prevents concurrent dispatcher access. Only cancellation
+// and locked output cross threads; direct handle callers remain serialized.
+public final class StdioMCPServer: @unchecked Sendable {
     private let dispatcher: ComputerUseToolDispatcher
+    private let requireAppIdentity: Bool
+    private let lane = NativeRequestLane()
+    private let outputLock = NSLock()
 
-    public init(service: ComputerUseService = ComputerUseService()) {
+    private func writeResponse(_ response: String?) {
+        guard let response else { return }
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        FileHandle.standardOutput.write(Data((response + "\n").utf8))
+    }
+
+    private func requestIdentity(_ value: Any?) -> String? {
+        guard let value, value is String || (value is NSNumber && CFGetTypeID(value as CFTypeRef) != CFBooleanGetTypeID()),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]) else { return nil }
+        return data.base64EncodedString()
+    }
+
+    public init(service: ComputerUseService = ComputerUseService(), requireAppIdentity: Bool = ProcessInfo.processInfo.environment["TAFFY_REQUIRE_APP_IDENTITY"] == "1") {
         self.dispatcher = ComputerUseToolDispatcher(service: service)
+        self.requireAppIdentity = requireAppIdentity
     }
 
     public func run() throws {
-        while let line = readLine(strippingNewline: true) {
+        try runTransport(read: { readLine(strippingNewline: true) },
+                         writeResponse: { [self] in writeResponse($0) },
+                         executeBound: { [self] in handle(line: $0, cancellation: $1) })
+    }
+
+    // Shared by production stdio and inert pipe tests. No alternate tool or
+    // environment flag exposes the test executor to an external caller.
+    func runTransport(read: () -> String?,
+                      writeResponse: @escaping @Sendable (String?) -> Void,
+                      executeBound: @escaping @Sendable (String, NativeOperationCancellation) -> String?) throws {
+        let operations = DispatchQueue(label: "taffy.native-bound-operation")
+        let pending = DispatchGroup()
+        while let line = read() {
             guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 continue
             }
 
-            if let response = handle(line: line) {
-                FileHandle.standardOutput.write((response + "\n").data(using: .utf8)!)
+            if requireAppIdentity, let payload = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] {
+                if payload["method"] as? String == "taffy/cancel-operation" {
+                    guard let params = payload["params"] as? [String: Any], Set(params.keys) == ["request_id"], let id = requestIdentity(params["request_id"]) else {
+                        writeResponse(try encodeJSONRPCError(id: payload["id"], code: -32602, message: "Cancellation requires only the original request_id."))
+                        continue
+                    }
+                    let cancelled = lane.cancel(id: id)
+                    if payload["id"] != nil { writeResponse(try encodeJSONRPCResult(id: payload["id"], result: ["cancellation_requested": cancelled, "cleanup_confirmed": false])) }
+                    continue
+                }
+                if payload["method"] as? String == "taffy/app-call" {
+                    guard let id = requestIdentity(payload["id"]) else {
+                        writeResponse(try encodeJSONRPCError(id: nil, code: -32600, message: "App-bound operations require a string or numeric request ID."))
+                        continue
+                    }
+                    guard let cancellation = lane.begin(id: id) else {
+                        writeResponse(try encodeJSONRPCError(id: payload["id"], code: -32000, message: "Native input is busy or cancelled; no additional operation was queued."))
+                        continue
+                    }
+                    pending.enter()
+                    operations.async { [self] in
+                        let response = executeBound(line, cancellation)
+                        lane.finish(cancellation)
+                        writeResponse(response)
+                        pending.leave()
+                    }
+                    continue
+                }
+                if lane.unavailable {
+                    writeResponse(try encodeJSONRPCError(id: payload["id"], code: -32000, message: "Native input is busy or cancelled; no additional operation was queued."))
+                    continue
+                }
             }
+            writeResponse(handle(line: line, cancellation: nil, cancellableTransport: requireAppIdentity))
         }
+        lane.close()
+        // EOF cancels input. Do not wait indefinitely for an OS call to return;
+        // the embedding host retains its process deadline and termination fence.
+        _ = pending.wait(timeout: .now() + 5)
     }
 
     public func handle(line: String) -> String? {
+        handle(line: line, cancellation: nil)
+    }
+
+    private func handle(line: String, cancellation: NativeOperationCancellation?, cancellableTransport: Bool = false) -> String? {
         do {
             guard let payload = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
                 return try encodeJSONRPCError(id: nil, code: -32700, message: "Invalid JSON-RPC payload")
@@ -48,6 +118,8 @@ public final class StdioMCPServer {
 
             switch method {
             case "initialize":
+                var experimental = ["taffy/appIdentityMetadata": 1, "taffy/appBoundOperations": 1]
+                if cancellableTransport { experimental["taffy/operationCancellation"] = 1 }
                 return try encodeJSONRPCResult(
                     id: id,
                     result: [
@@ -57,6 +129,7 @@ public final class StdioMCPServer {
                             "version": openComputerUseVersion,
                         ],
                         "capabilities": [
+                            "experimental": experimental,
                             "tools": [
                                 "listChanged": false,
                             ],
@@ -73,6 +146,21 @@ public final class StdioMCPServer {
                 return nil
             case "ping":
                 return try encodeJSONRPCResult(id: id, result: [:])
+            case "taffy/app-identity":
+                guard Set(params.keys) == ["query"], let query = params["query"] as? String else {
+                    throw ComputerUseError.invalidArguments("App identity lookup requires only a query string.")
+                }
+                return try encodeJSONRPCResult(id: id, result: AppIdentityResolver.resolve(query).asDictionary)
+            case "taffy/app-call":
+                guard Set(params.keys) == ["version", "identity", "name", "arguments"],
+                      let version = params["version"] as? NSNumber, CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1, version.doubleValue == 1,
+                      let identity = params["identity"] as? [String: Any],
+                      let name = params["name"] as? String,
+                      let arguments = params["arguments"] as? [String: Any] else {
+                    throw ComputerUseError.invalidArguments("App-bound calls require version 1, identity, name, and arguments.")
+                }
+                let result = try dispatcher.callBoundTool(name: name, arguments: arguments, identity: BoundAppIdentity.decode(identity), cancellation: cancellation)
+                return try encodeJSONRPCResult(id: id, result: result.asDictionary)
             case "tools/list":
                 return try encodeJSONRPCResult(
                     id: id,
@@ -83,6 +171,9 @@ public final class StdioMCPServer {
             case "tools/call":
                 let name = params["name"] as? String ?? ""
                 let arguments = params["arguments"] as? [String: Any] ?? [:]
+                if requireAppIdentity, name != "list_apps" {
+                    throw ComputerUseError.permissionDenied("This host requires app-bound input; refresh helper capabilities and use the app-bound contract.")
+                }
                 let result = try dispatcher.callTool(name: name, arguments: arguments)
                 return try encodeJSONRPCResult(
                     id: id,
